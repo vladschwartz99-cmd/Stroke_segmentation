@@ -50,7 +50,7 @@
 ├── .gitignore                      # Исключение тяжелых весов и датасета из контроля версий
 ├── EDA.ipynb                       # Ноутбук с анализом изображений и масок сегментации
 ├── model_exploration.ipynb         # Скрипт для обучения всех моделей с сохранением лучших весов
-├── LICENSE.txt                     # Текстовый документ с информацией о лицензии на данные
+├── DATA_LICENSE.txt                # Текстовый документ с информацией о лицензии на данные
 ├── requirements.txt                # Список зависимостей для развертывания проекта
 └── README.md                       # Документация проекта
 ```
@@ -80,12 +80,12 @@
 
 1. Клонируйте репозиторий:
    ```bash
-   git clone https://github.com/vladschwartz99-cmd/portfolio.git
+   git clone https://github.com/vladschwartz99-cmd/Stroke_segmetation.git
    ```
    
 2. Перейдите в директорию проекта:
    ```bash
-   cd portfolio/Stroke_segmentation
+   cd Stroke_segmentation
    ```
    
 3. Установите зависимости:
