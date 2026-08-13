@@ -17,3 +17,4 @@ ipywidgets
 jupyter
 einops
 medpy
+SimpleITK
