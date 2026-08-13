@@ -1,14 +1,18 @@
 import torch
 import tqdm
+import warnings
+import matplotlib.pyplot as plt
 from pathlib import Path
 from collections import defaultdict
 from IPython.display import clear_output
-import matplotlib.pyplot as plt
 from monai.inferers import sliding_window_inference
-
+from torch.special import logit
 
 # Устройство для вычислений
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Игнорирование предупреждения о пустых масках
+warnings.filterwarnings('ignore', message='Num foregrounds')
 
 
 def soft_dice_coef(pred, target, smooth=1e-5):
@@ -31,8 +35,11 @@ def soft_dice_coef(pred, target, smooth=1e-5):
 
 
 
-def train_one_epoch(model, optimizer, criterion, scaler, train_loader):
+def train_one_epoch(model, optimizer, criterion, scaler, train_loader, gradient_accumulation_steps):
     """Функция обучения модели в течении одной эпохи"""
+
+    # Шаг накопления градиентов
+    accumulation_steps = gradient_accumulation_steps
 
     model.train()
 
@@ -40,13 +47,13 @@ def train_one_epoch(model, optimizer, criterion, scaler, train_loader):
     train_loss = 0.0
     train_dice = 0.0
 
-    for images, masks in tqdm.tqdm_notebook(train_loader):
+    # Обнуление градиента перед началом эпохи
+    optimizer.zero_grad()
+
+    for batch_idx, (images, masks) in tqdm.tqdm_notebook(enumerate(train_loader), total=len(train_loader)):
 
         # Перевод данных на устройство
-        images, masks = images.to(device), masks.to(device)
-
-        # Обнуление градиента
-        optimizer.zero_grad()
+        images, masks = images.to(device), masks.to(device).float()
 
         # Переход с float32 на float16
         with torch.autocast(device_type='cuda', dtype=torch.float16):
@@ -61,18 +68,34 @@ def train_one_epoch(model, optimizer, criterion, scaler, train_loader):
             # Подсчет лосса
             loss = criterion(logits, masks)
 
+            # Сохранение лосса
+            train_loss += loss.item()
+
+            loss = loss / accumulation_steps
+
         # Расчет градиента и шаг оптимизатора
         scaler.scale(loss).backward()
-        scaler.step(optimizer)
 
-        # Обновление коэффициента масштабирования
-        scaler.update()
+        # Обновление весов после накопления градиентов и на последнем батче эпохи
+        if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
+
+            # Клиппинг градиентов
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            # Шаг оптимизатора
+            scaler.step(optimizer)
+
+            # Обновление коэффициента масштабирования
+            scaler.update()
+
+            # Обнуление градиента
+            optimizer.zero_grad()
 
         # Расчет метрик по батчам
-        train_loss += loss.item()
         train_dice += soft_dice_coef(logits, masks, smooth=1e-5).item()
 
-    # Расчет метрик для всего train
+    # Расчет метрик для всей эпохи
     epoch_train_loss = train_loss / len(train_loader)
     epoch_train_dice = train_dice / len(train_loader)
 
@@ -93,7 +116,7 @@ def validate_one_epoch(model, criterion, val_loader):
         for images, masks in tqdm.tqdm_notebook(val_loader):
 
             # Перевод данных на устройство
-            images, masks = images.to(device), masks.to(device)
+            images, masks = images.to(device), masks.to(device).float()
 
             # Переход с float32 на float16
             with torch.autocast(device_type='cuda', dtype=torch.float16):
@@ -116,7 +139,7 @@ def validate_one_epoch(model, criterion, val_loader):
             val_loss += loss.item()
             val_dice += soft_dice_coef(val_outputs, masks, smooth=1e-5).item()
 
-    # Расчет метрик для всего val
+    # Расчет метрик для всей эпохи
     epoch_val_loss = val_loss / len(val_loader)
     epoch_val_dice = val_dice / len(val_loader)
 
@@ -151,7 +174,7 @@ def plot_learning_curves(history):
 def train_model(
         model, criterion, optimizer, scheduler,
         train_loader, val_loader, weights_dir_name,
-        n_epochs=200, patience = 10,
+        n_epochs=200, patience = 10, gradient_accumulation_steps = 8
 ):
     """Функция полного обучения и валидации модели в течении n эпох,
             с ранней остановкой и сохранением лучших весов"""
@@ -175,10 +198,154 @@ def train_model(
     for epoch in range(n_epochs):
 
         # Обучение
-        train_loss, train_dice = train_one_epoch(model, optimizer, criterion, scaler, train_loader)
+        train_loss, train_dice = train_one_epoch(model, optimizer, criterion, scaler, train_loader, gradient_accumulation_steps)
 
         # Сохранение train метрик эпохи
         history['loss']['train'].append(train_loss)
+        history['dice']['train'].append(train_dice)
+
+        # Валидация
+        val_loss, val_dice = validate_one_epoch(model, criterion, val_loader)
+
+        # Сохранение val метрик эпохи
+        history['loss']['val'].append(val_loss)
+        history['dice']['val'].append(val_dice)
+
+        # Шаг планировщика
+        scheduler.step(val_dice)
+
+        if val_dice > best_val_dice:
+
+            # Пересохранение лучшей метрики
+            best_val_dice = val_dice
+
+            # Сохранение весов модели
+            save_path = weights_dir / f'best_{model.__class__.__name__}.pth'
+            torch.save(model.state_dict(), save_path)
+
+            # Обнуление счетчика эпох без улучшения
+            epochs_without_improvement = 0
+
+        # Шаг счетчика при отсутствии улучшения
+        else:
+            epochs_without_improvement += 1
+
+        # Ранняя остановка
+        if epochs_without_improvement >= patience:
+            break
+
+        # Избегание захломления вывода функции
+        clear_output()
+
+        # Вывод метрик эпохи
+        print(f'Epoch {epoch + 1} of {n_epochs}')
+        print(f'train loss: \t{train_loss:.6f}')
+        print(f'val loss: \t{val_loss:.6f}')
+        print(f'train dice: \t\t\t{train_dice:.2f}')
+        print(f'val dice: \t\t\t{val_dice:.2f}')
+
+        # Вывод кривых обучения по сохраненным значениям метрик
+        plot_learning_curves(history)
+
+
+
+def deep_supervision_train_one_epoch(model, optimizer, criterion, scaler, train_loader, gradient_accumulation_steps, weights_list):
+    """Функция обучения модели в течении одной эпохи с механизмом deep supervision"""
+
+    # Шаг накопления градиентов
+    accumulation_steps = gradient_accumulation_steps
+
+    model.train()
+
+    # Переменные для подсчета метрик
+    train_loss = 0.0
+    train_dice = 0.0
+
+    # Обнуление градиента перед началом эпохи
+    optimizer.zero_grad()
+
+    for batch_idx, (images, masks) in tqdm.tqdm_notebook(enumerate(train_loader), total=len(train_loader)):
+
+        # Перевод данных на устройство
+        images, masks = images.to(device), masks.to(device).float()
+
+        # Переход с float32 на float16
+        with torch.autocast(device_type='cuda', dtype=torch.float16):
+
+            # Получение ответа модели
+            outputs = model(images)
+            logits = outputs[-1]
+
+            total_loss = 0
+            for output, weight in zip(outputs, weights_list):
+                total_loss += weight * criterion(output, masks)
+
+            # Сохранение лосса
+            train_loss += total_loss
+
+            loss = total_loss / accumulation_steps
+
+        # Расчет градиента и шаг оптимизатора
+        scaler.scale(loss).backward()
+
+        # Обновление весов после накопления градиентов и на последнем батче эпохи
+        if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
+
+            # Клиппинг градиентов
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            # Шаг оптимизатора
+            scaler.step(optimizer)
+
+            # Обновление коэффициента масштабирования
+            scaler.update()
+
+            # Обнуление градиента
+            optimizer.zero_grad()
+
+        # Расчет метрик по батчам
+        train_dice += soft_dice_coef(logits, masks, smooth=1e-5).item()
+
+    # Расчет метрик для всей эпохи
+    epoch_train_loss = train_loss / len(train_loader)
+    epoch_train_dice = train_dice / len(train_loader)
+
+    return epoch_train_loss, epoch_train_dice
+
+
+
+def deep_supervision_train_model(
+        model, criterion, optimizer, scheduler,
+        train_loader, val_loader, weights_dir_name, weights_list,
+        n_epochs=200, patience = 10, gradient_accumulation_steps = 8
+):
+    """Функция полного обучения и валидации модели в течении n эпох, с ранней остановкой
+                и сохранением лучших весов и механизмом deep supervision"""
+
+    model = model.to(device)
+
+    # Словарь, для сохранения метрик между эпохами
+    history = defaultdict(lambda: defaultdict(list))
+
+    # Переменные для преждевременной остановки
+    best_val_dice = 0.0
+    epochs_without_improvement = 0
+
+    # Создание папки для сохранения весов
+    weights_dir = Path('weights') / weights_dir_name
+    weights_dir.mkdir(parents=True, exist_ok=True)
+
+    # Инициализация скейлера
+    scaler = torch.amp.GradScaler('cuda')
+
+    for epoch in range(n_epochs):
+
+        # Обучение
+        train_loss, train_dice = deep_supervision_train_one_epoch(model, optimizer, criterion, scaler, train_loader, gradient_accumulation_steps, weights_list)
+
+        # Сохранение train метрик эпохи
+        history['loss']['train'].append(train_loss.item())
         history['dice']['train'].append(train_dice)
 
         # Валидация
