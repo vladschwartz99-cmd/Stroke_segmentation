@@ -114,17 +114,43 @@ def get_unet_plus_plus(in_channels, load_weights=False):
 
 
 
-def get_swin_unetr(in_channels, load_weights=False):
+def get_swin_unetr(in_channels, pretrained=True, load_weights=False):
     """Функция инициализации модели Swin UNETR, функции потерь и оптимизатора"""
 
     # Инициализация Swin UNETR
     swin_unetr = SwinUNETR(
         in_channels=in_channels,
         out_channels=1,
-        feature_size=24,
+        feature_size=48,
         dropout_path_rate=0.1,
         use_checkpoint=True
     ).to(device)
+
+    if pretrained:
+
+        weights = torch.load(
+            './weights/swin_unetr_pretrained/ssl_pretrained_weights.pth',
+            map_location=device,
+            weights_only=False,
+        )['model']
+
+        model_dict = swin_unetr.state_dict()
+
+        filtered_weights = {}
+
+        for k, v in weights.items():
+
+            # пропускаем первый слой из-за каналов
+            if 'patch_embed.proj.weight' in k:
+                continue
+
+            if k in model_dict and v.shape == model_dict[k].shape:
+                filtered_weights[k] = v
+
+        swin_unetr.load_state_dict(
+            filtered_weights,
+            strict=False
+        )
 
     if load_weights:
 
@@ -147,3 +173,27 @@ def get_swin_unetr(in_channels, load_weights=False):
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)
 
         return swin_unetr, criterion, optimizer, scheduler
+
+
+
+def get_unet_plus_plus_for_refinement(load_weights=False):
+    """Функция инициализации модели 3D U-Net ++, для подбора гиперпараметров"""
+
+    # Инициализации 3D U-Net ++
+    unet_plus_plus = BasicUNetPlusPlus(
+        spatial_dims=3,
+        in_channels=3,
+        out_channels=1,
+        features=(16, 32, 64, 128, 256, 16)
+    ).to(device)
+
+    # Загрузка весов в модель
+    if load_weights:
+
+        unet_plus_plus.load_state_dict(torch.load('./weights/final_model/best_BasicUNetPlusPlus.pth'))
+        return unet_plus_plus
+
+    # Возвращение модели без весов
+    else:
+
+        return unet_plus_plus
