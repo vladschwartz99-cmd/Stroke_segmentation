@@ -1,12 +1,12 @@
 import pandas as pd
 from sklearn.model_selection import StratifiedGroupKFold
+from torch.utils.data import Dataset, DataLoader
 from monai.transforms import (
     Compose, LoadImaged, EnsureChannelFirstd, Orientationd, Spacingd,
     CropForegroundd,  RandCropByPosNegLabeld, SpatialPadd, ConcatItemsd,
     DeleteItemsd, ScaleIntensityRangePercentilesd, RandRotated, RandFlipd,
-    RandGaussianNoised, RandAdjustContrastd, CastToTyped
+    RandGaussianNoised, RandAdjustContrastd, CastToTyped, EnsureTyped
 )
-from torch.utils.data import Dataset, DataLoader
 from src.data_utils import build_dataframe_to_split
 
 
@@ -19,10 +19,10 @@ def split_dataset(random_state=42):
     df_to_split = build_dataframe_to_split()
 
     # Поскольку StratifiedGroupKFold плохо работает с малыми классами,
-    # отделим их и позже добавим вручную (2 группы по 3 пациента в каждой)
+    # отделим их и позже добавим вручную
     no_lesion_group = df_to_split[df_to_split['lesion_label'] == 'no_lesion']
-    one_large_lesion_group = df_to_split[df_to_split['lesion_label'] == 'one_large_lesion']
-    large_groups = df_to_split[~df_to_split['lesion_label'].isin(['no_lesion', 'one_large_lesion'])]
+    multiple_only_small_group = df_to_split[df_to_split['lesion_label'] == 'multiple_only_small_lesion']
+    large_groups = df_to_split[~df_to_split['lesion_label'].isin(['no_lesion', 'multiple_only_small_lesion'])]
 
     # Разбиваем данные на train и test_val
     splitter_1 = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=random_state)
@@ -39,15 +39,15 @@ def split_dataset(random_state=42):
     val_df = test_val_df.iloc[val_ids]
     test_df = test_val_df.iloc[test_ids]
 
-    # Получение уникальных id пациентов для групп
+    # Получение id пациентов для малых групп
     no_lesion_group_ids = no_lesion_group['patient_id'].unique()
-    one_large_lesion_group_ids = one_large_lesion_group['patient_id'].unique()
+    multiple_only_small_group_ids = multiple_only_small_group['patient_id'].unique()
 
     # Добавление пациентов из малых групп в train
     train_df = pd.concat(
         [train_df,
          no_lesion_group[no_lesion_group['patient_id'] == no_lesion_group_ids[0]],
-         one_large_lesion_group[one_large_lesion_group['patient_id'] == one_large_lesion_group_ids[0]]
+         multiple_only_small_group[multiple_only_small_group['patient_id'] == multiple_only_small_group_ids[0]]
         ],
         ignore_index=True
     )
@@ -55,8 +55,7 @@ def split_dataset(random_state=42):
     # Добавление пациентов из малых групп в val
     val_df = pd.concat(
         [val_df,
-         no_lesion_group[no_lesion_group['patient_id'] == no_lesion_group_ids[1]],
-         one_large_lesion_group[one_large_lesion_group['patient_id'] == one_large_lesion_group_ids[1]]
+         no_lesion_group[no_lesion_group['patient_id'] == no_lesion_group_ids[1]]
         ],
         ignore_index=True
     )
@@ -65,7 +64,7 @@ def split_dataset(random_state=42):
     test_df = pd.concat(
         [test_df,
          no_lesion_group[no_lesion_group['patient_id'] == no_lesion_group_ids[2]],
-         one_large_lesion_group[one_large_lesion_group['patient_id'] == one_large_lesion_group_ids[2]]
+         multiple_only_small_group[multiple_only_small_group['patient_id'] == multiple_only_small_group_ids[1]]
         ],
         ignore_index=True
     )
@@ -203,11 +202,8 @@ def get_transforms(protocols_list, augmentations=False):
             # Удаляем ненужные ключи
             DeleteItemsd(keys=protocols_list),
 
-            # Приведение изображений к нужному формату данных
-            CastToTyped(keys=['image'], dtype='float32'),
-
-            # Приведение масок к нужному формату данных
-            CastToTyped(keys=['mask'], dtype='uint8')
+            # Приведение изображений и масок к нужному формату данных
+            EnsureTyped(keys=['image', 'mask'])
         ])
 
         return test_transforms
@@ -217,7 +213,7 @@ def get_transforms(protocols_list, augmentations=False):
 class MRIDataset(Dataset):
     """Класс для формирования пар предобработанных изображения и маски"""
 
-    def __init__(self, subset_df, protocols_list, augmentations=False):
+    def __init__(self, subset_df, protocols_list, augmentations=False, save_transforms_meta=False):
         self.patient_ids = subset_df['patient_id'].unique()
         self.flair_df = subset_df[subset_df['label'] == 'flair']
         self.adc_df = subset_df[subset_df['label'] == 'adc']
@@ -226,6 +222,7 @@ class MRIDataset(Dataset):
         self.augmentations = augmentations
         self.protocols_list = protocols_list
         self.transformer = get_transforms(protocols_list=self.protocols_list, augmentations=self.augmentations)
+        self.save_transforms_meta = save_transforms_meta
 
 
     def __getitem__(self, idx):
@@ -253,6 +250,9 @@ class MRIDataset(Dataset):
         if isinstance(transformed, list):
             transformed = transformed[0]
 
+        if self.save_transforms_meta:
+            return transformed
+
         return transformed['image'], transformed['mask']
 
 
@@ -261,10 +261,10 @@ class MRIDataset(Dataset):
 
 
 
-def build_loader(subset_df, protocols_list, augmentations=False, batch_size=8, shuffle=False):
+def build_loader(subset_df, protocols_list, augmentations=False, batch_size=8, shuffle=False, save_transforms_meta=False):
     """Функция, формирующая loader для подвыборки"""
 
-    dataset = MRIDataset(subset_df, protocols_list=protocols_list, augmentations=augmentations)
+    dataset = MRIDataset(subset_df, protocols_list=protocols_list, augmentations=augmentations, save_transforms_meta=save_transforms_meta)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
     return loader
