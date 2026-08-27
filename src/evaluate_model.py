@@ -12,7 +12,7 @@ from src.preprocessing import build_loader
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-def get_prediction(image, model):
+def get_prediction(image, model, patch_size=(96, 96, 96)):
     """Функция формирующая маску сегментации на основе предсказания модели"""
 
     # Перенос изображения на устройство для вычислений
@@ -23,13 +23,49 @@ def get_prediction(image, model):
 
         # Патчинг изображения и получение ответа модели
         logits = sliding_window_inference(
-            inputs=image, roi_size=(96, 96, 96),
+            inputs=image, roi_size=patch_size,
             sw_batch_size=1, predictor=model,
             overlap=0.5, mode='gaussian'
         )
 
     # Преобразование в маску вероятностей
     pred_mask = torch.sigmoid(logits)
+
+    return pred_mask
+
+
+
+def get_ensemble_prediction(image, large_model, small_model, patch_size=(96, 96, 96)):
+    """Функция формирующая маску сегментации на основе предсказания модели"""
+
+    # Перенос изображения на устройство для вычислений
+    image = image.to(device)
+
+    large_model.eval()
+    with torch.no_grad():
+
+        # Патчинг изображения и получение ответа модели
+        large_logits = sliding_window_inference(
+            inputs=image, roi_size=patch_size,
+            sw_batch_size=1, predictor=large_model,
+            overlap=0.5, mode='gaussian'
+        )
+
+    small_model.eval()
+    with torch.no_grad():
+
+        # Патчинг изображения и получение ответа модели
+        small_logits = sliding_window_inference(
+            inputs=image, roi_size=patch_size,
+            sw_batch_size=1, predictor=small_model,
+            overlap=0.5, mode='gaussian'
+        )
+
+    # Преобразование в маску вероятностей
+    large_pred_mask = torch.sigmoid(large_logits)
+    small_pred_mask = torch.sigmoid(small_logits)
+
+    pred_mask = torch.max(large_pred_mask, small_pred_mask)
 
     return pred_mask
 
@@ -106,7 +142,7 @@ def get_overlaps(pred_mask, true_mask):
 
 
 
-def global_metrics(pred_true_masks, threshold=0.5):
+def global_metrics(pred_true_masks, threshold=0.5, bin_opening=True):
     """Функция, рассчитывающая метрики на уровне целых снимков"""
 
     # Метрики для подсчета
@@ -122,14 +158,19 @@ def global_metrics(pred_true_masks, threshold=0.5):
         # Преобразование предсказанной маски в бинарную на основе порога уверенности
         pred_mask_raw = pred_mask_raw > threshold
 
-        # Морфологическое открытие масок и его отмена
-        # при удалении сегментации
-        true_mask = binary_opening(true_mask_raw)
-        if np.sum(true_mask) == 0:
-            true_mask = true_mask_raw
+        if bin_opening:
+            # Морфологическое открытие масок и его отмена
+            # при удалении сегментации
+            true_mask = binary_opening(true_mask_raw)
+            if np.sum(true_mask) == 0:
+                true_mask = true_mask_raw
 
-        pred_mask = binary_opening(pred_mask_raw)
-        if np.sum(pred_mask) == 0:
+            pred_mask = binary_opening(pred_mask_raw)
+            if np.sum(pred_mask) == 0:
+                pred_mask = pred_mask_raw
+
+        else:
+            true_mask = true_mask_raw
             pred_mask = pred_mask_raw
 
         # Добавление объемов поражения исходной и предсказанной маски в списки
@@ -193,7 +234,10 @@ def global_metrics(pred_true_masks, threshold=0.5):
 
 
 
-def find_optim_threshold(model, test_loader):
+def find_optim_threshold(
+        model, test_loader, small_model=None,
+        patch_size=(96, 96, 96), bin_opening=True
+):
     """Функция, подсчитывающая глобальные метрики для разных порогов уверенности модели"""
 
     thresholds_metrics_list = []
@@ -203,7 +247,11 @@ def find_optim_threshold(model, test_loader):
     # Получение предсказаний модели
     for image, true_mask in test_loader:
 
-        pred_mask = get_prediction(image, model)
+        if small_model:
+            pred_mask = get_ensemble_prediction(image, model, small_model, patch_size=patch_size)
+
+        else:
+            pred_mask = get_prediction(image, model, patch_size=patch_size)
 
         # Добавление в список пар предсказанных и истинных масок
         pred_true_masks.append(
@@ -215,7 +263,7 @@ def find_optim_threshold(model, test_loader):
     for threshold in np.arange(0.1, 1, 0.05):
 
         # Получение метрик для порога уверенности
-        metrics_dict = global_metrics(pred_true_masks, threshold=threshold)
+        metrics_dict = global_metrics(pred_true_masks, threshold=threshold, bin_opening=bin_opening)
 
         # Добавление метрик в общий список
         thresholds_metrics_list.append(metrics_dict)
@@ -240,7 +288,11 @@ def find_optim_threshold(model, test_loader):
 
 
 
-def groups_metrics_reports(model, patients_df, protocols_list, threshold=0.5):
+def groups_metrics_reports(
+        model, patients_df, protocols_list,
+        small_model=None, threshold=0.5, patch_size=(96, 96, 96),
+        bin_opening=True, without_overlap_threshold=False
+):
     """Функция, рассчитывающая метрики сегментации по группам пациентов и по объему очагов"""
 
     # Список для сохранения итоговых метрик по группам
@@ -283,19 +335,29 @@ def groups_metrics_reports(model, patients_df, protocols_list, threshold=0.5):
         for patient_id, (image, true_mask_raw) in zip(patients_ids, group_loader):
 
             # Получение предсказанной маски
-            pred_mask_raw = get_prediction(image, model)
+            if small_model:
+                pred_mask_raw = get_ensemble_prediction(image, model, small_model, patch_size=patch_size)
+
+            else:
+                pred_mask_raw = get_prediction(image, model, patch_size=patch_size)
 
             # Преобразование в бинарную маску по порогу
             pred_mask_raw = pred_mask_raw > threshold
 
-            # Морфологическое открытие масок и его отмена
-            # при удалении сегментации
-            true_mask = binary_opening(true_mask_raw)
-            if np.sum(true_mask) == 0:
-                true_mask = true_mask_raw
 
-            pred_mask = binary_opening(pred_mask_raw.cpu())
-            if np.sum(pred_mask) == 0:
+            if bin_opening:
+                # Морфологическое открытие масок и его отмена
+                # при удалении сегментации
+                true_mask = binary_opening(true_mask_raw)
+                if np.sum(true_mask) == 0:
+                    true_mask = true_mask_raw
+
+                pred_mask = binary_opening(pred_mask_raw.cpu())
+                if np.sum(pred_mask) == 0:
+                    pred_mask = pred_mask_raw
+
+            else:
+                true_mask = true_mask_raw
                 pred_mask = pred_mask_raw
 
             # Перевод масок на cpu
@@ -308,20 +370,41 @@ def groups_metrics_reports(model, patients_df, protocols_list, threshold=0.5):
             # Расчет доли пересечения истинной и предсказанной масок
             pred_overlap, true_overlap = get_overlaps(pred_mask, true_mask)
 
-            # Если маски пересекаются (с небольшим порогом из-за большого количества мелких очагов)
-            if true_overlap >= 0.15 and pred_overlap >= 0.15:
-                tp += 1
+            # Подсчет без порога пересечения
+            if without_overlap_threshold:
 
-            # Если пересечение меньше
+                # Если маски пересекаются
+                if true_overlap > 0 and pred_overlap > 0:
+                    tp += 1
+
+                # Если не пересекаются
+                else:
+
+                    # Если исходная маска не пустая
+                    if np.any(true_mask):
+                        fn += 1
+
+                    # Если предсказанная маска не пустая
+                    if np.any(pred_mask):
+                        fp += 1
+
+            # Подсчет с порогом пересечения
             else:
 
-                # Если исходная маска не пустая
-                if np.any(true_mask):
-                    fn += 1
+                # Если маски пересекаются (с небольшим порогом из-за большого количества мелких очагов)
+                if true_overlap >= 0.15 and pred_overlap >= 0.15:
+                    tp += 1
 
-                # Если предсказанная маска не пустая
-                if np.any(pred_mask):
-                    fp += 1
+                # Если пересечение меньше
+                else:
+
+                    # Если исходная маска не пустая
+                    if np.any(true_mask):
+                        fn += 1
+
+                    # Если предсказанная маска не пустая
+                    if np.any(pred_mask):
+                        fp += 1
 
             # Добавление объемов поражения исходной и предсказанной маски в списки
             true_volumes.append(np.sum(true_mask))
@@ -439,8 +522,7 @@ def groups_metrics_reports(model, patients_df, protocols_list, threshold=0.5):
 
         # Вычисление f1
         f1 = (
-            2 * (precision * recall) /
-            (precision + recall)
+            2 * (precision * recall) / (precision + recall)
             if precision + recall > 0 else 0.0
         )
 
@@ -564,3 +646,271 @@ def best_worst_patient_segmentation(test_df, patients_dice_df):
         .head(3)['patient_id'].tolist())
 
     return best_dice_patients_idx, worst_dice_patients_idx
+
+
+
+def confusion_matrix_for_patient(pred_mask, true_mask, overlap_threshold=0.15):
+    """Функция расчета TP, FP, FN, TN для одного пациента на
+            основе пересечения предсказанной и истинной масок"""
+
+    # Перевод масок в булев тип
+    true_mask = np.asarray(true_mask).astype(bool)
+    pred_mask = np.asarray(pred_mask).astype(bool)
+
+    # Расчет объема исходной и предсказанной сегментаций
+    pred_volume = np.sum(pred_mask)
+    true_volume = np.sum(true_mask)
+
+    tp, fp, fn, tn = 0, 0, 0, 0
+
+    # При отсутствии исходной и предсказанной сегментации
+    if true_volume == 0 and pred_volume == 0:
+        fn = 1
+        return tp, fp, fn, tn
+
+    # При отсутствии исходной, но наличии предсказанной сегментации
+    if true_volume == 0 and pred_volume > 0:
+        fp = 1
+        return tp, fp, fn, tn
+
+    # При наличии исходной, но отсутствии предсказанной сегментации
+    if true_volume > 0 and pred_volume == 0:
+        fn = 1
+        return tp, fp, fn, tn
+
+    # Подсчет долей пересечения исходной и предсказанной сегментации при их совместном наличии
+    intersection = np.sum(true_mask & pred_mask)
+    pred_overlap = intersection / pred_volume
+    true_overlap = intersection / true_volume
+
+    # При достаточном пересечении
+    if pred_overlap >= overlap_threshold and true_overlap >= overlap_threshold:
+        tp = 1
+        return tp, fp, fn, tn
+
+    # При недостаточном пересечении
+    fp = 1
+    fn = 1
+    return tp, fp, fn, tn
+
+
+
+def confusion_matrix(patients_df, large_model, small_model, threshold=0.5, overlap_threshold=0.15):
+    """Расчет матрицы ошибок для множества пациентов"""
+
+    # Список для сохранения итоговых метрик по группам
+    groups_metrics = []
+
+    # Получение названий групп пациентов
+    patients_groups = patients_df['lesion_label'].unique()
+
+    # Для каждой группы
+    for group in patients_groups:
+
+        # Формирование подвыборки из пациентов определенной группы
+        group_df = patients_df[patients_df['lesion_label'] == group]
+
+        # Преобразование в лоадер
+        group_loader = build_loader(
+            group_df, ['dwi', 'adc', 'flair'],
+            augmentations=False, batch_size=1, shuffle=False
+        )
+
+        # Метрики для подсчета
+        tp, fp, fn, tn = 0, 0, 0, 0
+
+        # Для каждого пациента
+        for image, true_mask_raw in group_loader:
+
+            # Получение предсказания
+            pred_mask_raw = get_ensemble_prediction(image, large_model, small_model)
+
+            # Преобразование в бинарную маску по порогу
+            pred_mask_raw = pred_mask_raw > threshold
+
+            # Морфологическое открытие масок и его отмена
+            # при удалении сегментации
+            true_mask = binary_opening(true_mask_raw)
+            if np.sum(true_mask) == 0:
+                true_mask = true_mask_raw
+
+            pred_mask = binary_opening(pred_mask_raw.cpu())
+            if np.sum(pred_mask) == 0:
+                pred_mask = pred_mask_raw
+
+            # Перевод масок на cpu
+            pred_mask, true_mask = pred_mask.to('cpu'), true_mask.to('cpu')
+
+            # Вычисление TP, FP, FN, TN для одного пациента
+            patient_tp, patient_fp, patient_fn, patient_tn = (
+                confusion_matrix_for_patient(pred_mask, true_mask, overlap_threshold=overlap_threshold)
+            )
+
+            # Обновление счетчиков
+            tp += patient_tp
+            fp += patient_fp
+            fn += patient_fn
+            tn += patient_tn
+
+        groups_metrics.append({
+            'group': group,
+            'tp': tp,
+            'fp': fp,
+            'fn': fn,
+            'tn': tn,
+        })
+
+    confusion_matrix_df = pd.DataFrame(groups_metrics, columns=['group', 'tp', 'fp', 'fn', 'tn'])
+
+    return confusion_matrix_df
+
+
+
+def lesion_wise_f1(pred_mask, true_mask, overlap_threshold=0.15):
+    """Функция подсчета F1 на уровне очагов"""
+
+    # Перевод масок в булев тип
+    true_mask = np.asarray(true_mask).astype(bool)
+    pred_mask = np.asarray(pred_mask).astype(bool)
+
+    # Подсчет количества очагов на истинной и предсказанной масках
+    pred_labels, pred_n = label(pred_mask)
+    true_labels, true_n = label(true_mask)
+
+    # Список возможных совпадений
+    matches = []
+
+    # Проход по истинным очагам
+    for true_id in range(1, true_n + 1):
+
+        # Формирование маски одного очага и подсчет его объема
+        true_lesion = true_labels == true_id
+        true_volume = np.sum(true_lesion)
+
+        # Получение компонент предсказанной сегментации, пересекающихся с очагом
+        overlapping_pred_ids = np.unique(pred_labels[true_lesion])
+        overlapping_pred_ids = overlapping_pred_ids[overlapping_pred_ids > 0]
+
+        # Проход по совпадающим компонентам
+        for pred_id in overlapping_pred_ids:
+
+            # Формирование маски одного очага и подсчет его объема
+            pred_lesion = pred_labels == pred_id
+            pred_volume = np.sum(pred_lesion)
+
+            # Подсчет пересечений
+            intersection = np.sum(true_lesion & pred_lesion)
+            true_overlap = intersection / true_volume
+            pred_overlap = intersection / pred_volume
+
+            # При достаточном пересечении
+            if true_overlap >= overlap_threshold and pred_overlap >= overlap_threshold:
+
+                # Сохраняем качество совпадения для последующего выбора лучшего
+                matches.append((true_overlap + pred_overlap, true_id, pred_id))
+
+    # Выбор наилучшего совпадения
+    matches.sort(reverse=True)
+
+    matched_true = set()
+    matched_pred = set()
+
+    tp = 0
+
+    for score, true_id, pred_id in matches:
+
+        if true_id not in matched_true and pred_id not in matched_pred:
+
+            matched_true.add(true_id)
+            matched_pred.add(pred_id)
+
+            tp += 1
+
+    # Ненайденные истинные очаги
+    fn = true_n - tp
+
+    # Лишние предсказанные очаги
+    fp = pred_n - tp
+
+    recall = tp / (tp + fn) if tp + fn > 0 else 0.0
+    precision = tp / (tp + fp) if tp + fp > 0 else 0.0
+
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if precision + recall > 0 else 0.0
+    )
+
+    return f1, precision, recall
+
+
+def lesion_wise_metrics(patients_df, large_model, small_model, threshold=0.5, overlap_threshold=0.15):
+    """Расчет матрицы ошибок для множества пациентов"""
+
+    # Список для сохранения итоговых метрик по группам
+    groups_metrics = []
+
+    # Получение названий групп пациентов
+    patients_groups = patients_df['lesion_label'].unique()
+
+    # Для каждой группы
+    for group in patients_groups:
+
+        # Формирование подвыборки из пациентов определенной группы
+        group_df = patients_df[patients_df['lesion_label'] == group]
+
+        # Преобразование в лоадер
+        group_loader = build_loader(
+            group_df, ['dwi', 'adc', 'flair'],
+            augmentations=False, batch_size=1, shuffle=False
+        )
+
+        # Метрики для подсчета
+        n, f1, precision, recall = 0, 0, 0, 0
+
+        # Для каждого пациента
+        for image, true_mask_raw in group_loader:
+
+            # Получение предсказания
+            pred_mask_raw = get_ensemble_prediction(image, large_model, small_model)
+
+            # Преобразование в бинарную маску по порогу
+            pred_mask_raw = pred_mask_raw > threshold
+
+            # Морфологическое открытие масок и его отмена
+            # при удалении сегментации
+            true_mask = binary_opening(true_mask_raw)
+            if np.sum(true_mask) == 0:
+                true_mask = true_mask_raw
+
+            pred_mask = binary_opening(pred_mask_raw.cpu())
+            if np.sum(pred_mask) == 0:
+                pred_mask = pred_mask_raw
+
+            # Перевод масок на cpu
+            pred_mask, true_mask = pred_mask.to('cpu'), true_mask.to('cpu')
+
+            # Вычисление TP, FP, FN, TN для одного пациента
+            patient_f1, patient_precision, patient_recall = (
+                lesion_wise_f1(pred_mask, true_mask, overlap_threshold=overlap_threshold)
+            )
+
+            # Обновление счетчиков
+            n += 1
+            f1 += patient_f1
+            precision += patient_precision
+            recall += patient_recall
+
+        f1 = f1 / n
+        precision = precision / n
+        recall = recall / n
+
+        groups_metrics.append({
+            'group': group,
+            'f1': f1,
+            'precision': precision,
+            'recall': recall,
+        })
+
+    f1_matrix_df = pd.DataFrame(groups_metrics, columns=['group', 'f1', 'precision', 'recall'])
+
+    return f1_matrix_df
