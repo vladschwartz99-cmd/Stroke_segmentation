@@ -48,7 +48,7 @@ def count_file_type(dataset_path):
 
 
 
-def build_paths_df(dataset_path):
+def build_paths_df(dataset_path, register_flair=False, split_masks=False):
     """Функция, формирующая датафрейм с полными путями к МР-изображениям и маскам,
                     ID пациентов и протоколами МРТ/метками маски"""
 
@@ -63,65 +63,59 @@ def build_paths_df(dataset_path):
 
         # Условие для выявления масок
         if file.parents[2].name == 'derivatives':
-            patient_id = int(file.parents[1].name[-4:])
-            label = 'mask'
+
+            # Если нужны маски, разбитые на крупные и мелкие очаги
+            if split_masks:
+
+                # Условие для масок крупных очагов
+                if 'large' in file.name:
+                    patient_id = int(file.parents[1].name[-4:])
+                    label = 'large_mask'
+
+                # Условие для масок мелких очагов
+                elif 'small' in file.name:
+                    patient_id = int(file.parents[1].name[-4:])
+                    label = 'small_mask'
+
+                # Условие для исходных масок
+                else:
+                    patient_id = int(file.parents[1].name[-4:])
+                    label = 'mask'
+
+            # Если нужны только исходные маски
+            else:
+
+                # Пропуск неполных масок
+                if 'large' not in file.name and 'small' not in file.name:
+                    patient_id = int(file.parents[1].name[-4:])
+                    label = 'mask'
 
         # Условие для выявления FLAIR изображений
         elif file.parent.name == 'anat':
-            patient_id = int(file.parents[2].name[-4:])
-            label = 'flair'
 
-        # Остальные случаи, так как структура пути к DWI и ADC разнится для некоторых файлов
-        else:
-            patient_id = int(file.parents[3].name[-4:])
+            # Если нужны регистрированные FLAIR
+            if register_flair:
 
-            # Обновление id пациента, если снимок не вложен в отдельную папку
-            if patient_id == 2022:
-                patient_id = int(file.parents[2].name[-4:])
+                # Условие для выявления регистрированных FLAIR изображений
+                if 'register' in file.name:
+                    patient_id = int(file.parents[2].name[-4:])
+                    label = 'flair'
 
-            # К счастью протокол (в отличие от id пациента) указан в названии каждого снимка
-            label = 'adc' if 'adc' in file.name else 'dwi'
+                # Пропуск исходных FLAIR
+                else:
+                    continue
 
-        # Добавление в общий список
-        data_list.append({
-            'file_path': file,
-            'patient_id': patient_id,
-            'label': label,
-        })
+            # Если нужны исходные FLAIR
+            else:
 
-    # Создаем датафрейм
-    df = pd.DataFrame(data_list, columns=['file_path', 'patient_id', 'label'])
+                # Условие для выявления исходных FLAIR изображений
+                if 'register' not in file.name:
+                    patient_id = int(file.parents[2].name[-4:])
+                    label = 'flair'
 
-    return df
-
-
-
-def build_paths_df_to_split(dataset_path):
-    """Функция, формирующая датафрейм с полными путями к МР-изображениям после регистрации
-                    и маскам, ID пациентов и протоколами МРТ/метками маски"""
-
-    # Список для сбора данных о файлах
-    data_list = []
-
-    # Сбор полных путей всех файлов .nii
-    nii_files = [nii for nii in dataset_path.rglob('*.nii*') if nii.is_file()]
-
-    # Получение дополнительных данных для каждого снимка
-    for file in nii_files:
-
-        # Условие для выявления масок
-        if file.parents[2].name == 'derivatives':
-            patient_id = int(file.parents[1].name[-4:])
-            label = 'mask'
-
-        # Условие для выявления регистрированных FLAIR изображений
-        elif file.parent.name == 'anat' and 'register' in file.name:
-            patient_id = int(file.parents[2].name[-4:])
-            label = 'flair'
-
-        # Пропуск исходных FLAIR
-        elif file.parent.name == 'anat' and 'register' not in file.name:
-            continue
+                # Пропуск регистрированных FLAIR
+                else:
+                    continue
 
         # Остальные случаи, так как структура пути к DWI и ADC разнится для некоторых файлов
         else:
@@ -177,15 +171,24 @@ def add_label(row):
 
 
 
-def build_dataframe_to_split():
+def build_dataframe_to_split(to_ensemble=False):
     """Функция, формирующая датафрейм из путей к изображениям и признаков,
                 необходимых для разбиения на подвыборки"""
 
     # Получение пути к датафрейму (и загрузка при его отсутствии)
     dataset_path = download_data()
 
-    # Формирование датафрейма из пути к файлу, id пациента и маркера протокола/маски
-    paths_df = build_paths_df_to_split(dataset_path)
+    # При использовании масок разбитых на крупные и мелкие очаги
+    if to_ensemble:
+
+        # Формирование датафрейма из пути к файлу, id пациента и маркера протокола/масок
+        paths_df = build_paths_df(dataset_path, register_flair=True, split_masks=True)
+
+    # При использовании только исходных масок
+    else:
+
+        # Формирование датафрейма из пути к файлу, id пациента и маркера протокола/маски
+        paths_df = build_paths_df(dataset_path, register_flair=True)
 
     # Получение датафрейма масок сегментации
     masks_df = paths_df[paths_df['label'] == 'mask']
