@@ -1,4 +1,7 @@
+import nibabel
+import math
 import pandas as pd
+import numpy as np
 from sklearn.model_selection import StratifiedGroupKFold
 from torch.utils.data import Dataset, DataLoader
 from monai.transforms import (
@@ -7,16 +10,17 @@ from monai.transforms import (
     DeleteItemsd, ScaleIntensityRangePercentilesd, RandRotated, RandFlipd,
     RandGaussianNoised, RandAdjustContrastd, CastToTyped, EnsureTyped
 )
+from scipy.ndimage import label
 from src.data_utils import build_dataframe_to_split
 
 
 
-def split_dataset(random_state=42):
+def split_dataset(random_state=42, to_ensemble=False):
     """Функция, разбивающая датасет на train, val и test со стратификацией по
                 id пациента и группе количества и объема очагов"""
 
     # Получение датафрейма с признаками, необходимыми для разбиения со стратификацией
-    df_to_split = build_dataframe_to_split()
+    df_to_split = build_dataframe_to_split(to_ensemble=to_ensemble)
 
     # Поскольку StratifiedGroupKFold плохо работает с малыми классами,
     # отделим их и позже добавим вручную
@@ -73,7 +77,7 @@ def split_dataset(random_state=42):
 
 
 
-def get_transforms(protocols_list, augmentations=False):
+def get_transforms(protocols_list, patch_size=(96, 96, 96), augmentations=False):
     """Функция, формирующая протокол трансформаций train и val/test для заданного количества изображений"""
 
     # Добавление маски к списку протоколов
@@ -121,13 +125,13 @@ def get_transforms(protocols_list, augmentations=False):
 
             # Патчинг со сдвигом в сторону очагов инсульта для борьбы с дисбалансом классов
             RandCropByPosNegLabeld(
-                keys=['image', 'mask'], label_key='mask', spatial_size=(96, 96, 96),
+                keys=['image', 'mask'], label_key='mask', spatial_size=patch_size,
                 pos=3, neg=1, num_samples=1
             ),
 
             # Паддинг изображения, в случае если размер изображения не позволил вырезать патч нужного размера
             SpatialPadd(
-                keys=['image', 'mask'], spatial_size=(96, 96, 96),
+                keys=['image', 'mask'], spatial_size=patch_size,
                 mode=('constant', 'constant'), value=(0, 0)
             ),
 
@@ -213,15 +217,16 @@ def get_transforms(protocols_list, augmentations=False):
 class MRIDataset(Dataset):
     """Класс для формирования пар предобработанных изображения и маски"""
 
-    def __init__(self, subset_df, protocols_list, augmentations=False, save_transforms_meta=False):
+    def __init__(self, subset_df, protocols_list, mask_label='mask', patch_size=(96, 96, 96), augmentations=False, save_transforms_meta=False):
         self.patient_ids = subset_df['patient_id'].unique()
         self.flair_df = subset_df[subset_df['label'] == 'flair']
         self.adc_df = subset_df[subset_df['label'] == 'adc']
         self.dwi_df = subset_df[subset_df['label'] == 'dwi']
-        self.masks_df = subset_df[subset_df['label'] == 'mask']
+        self.masks_df = subset_df[subset_df['label'] == mask_label]
         self.augmentations = augmentations
+        self.mask_label = mask_label
         self.protocols_list = protocols_list
-        self.transformer = get_transforms(protocols_list=self.protocols_list, augmentations=self.augmentations)
+        self.transformer = get_transforms(protocols_list=self.protocols_list, patch_size=patch_size, augmentations=self.augmentations)
         self.save_transforms_meta = save_transforms_meta
 
 
@@ -261,10 +266,65 @@ class MRIDataset(Dataset):
 
 
 
-def build_loader(subset_df, protocols_list, augmentations=False, batch_size=8, shuffle=False, save_transforms_meta=False):
+def build_loader(
+        subset_df, protocols_list, mask_label='mask', patch_size=(96, 96, 96),
+        augmentations=False, batch_size=8, shuffle=False,
+        save_transforms_meta=False
+):
     """Функция, формирующая loader для подвыборки"""
 
-    dataset = MRIDataset(subset_df, protocols_list=protocols_list, augmentations=augmentations, save_transforms_meta=save_transforms_meta)
+    dataset = MRIDataset(
+        subset_df, protocols_list=protocols_list, mask_label=mask_label, patch_size=patch_size,
+        augmentations=augmentations, save_transforms_meta=save_transforms_meta
+    )
+
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
     return loader
+
+
+
+def split_mask(mask_path, patient_id):
+    """Функция, разбивающая маску исходной сегментации на маски крупных и мелких очагов"""
+
+    # Загрузка и получение содержимого маски
+    mask_img = nibabel.load(mask_path)
+    full_mask = mask_img.get_fdata()
+
+    # Получение объема вокселя маски и матрицы афинных преобразований
+    metadata = mask_img.header
+    voxel_volume = math.prod(metadata['pixdim'][1:4])
+    affine = mask_img.affine
+
+    # Выделение отдельных очагов
+    labels, n = label(full_mask)
+
+    # Создание пустых масок размера исходной
+    large_mask = np.zeros_like(full_mask)
+    small_mask = np.zeros_like(full_mask)
+
+    # Вычисление объема каждого очага и добавление в маску
+    for lesion_id in range(1, n + 1):
+
+        # Получение маски очага и вычисление его объема
+        lesion = labels == lesion_id
+        volume = lesion.sum() * voxel_volume
+
+        # Добавление очага в соответствующую маску
+        if volume > 44.11:
+            large_mask[lesion] = 1
+        else:
+            small_mask[lesion] = 1
+
+    # Преобразуем новые маски в NifTi
+    large_mask = nibabel.Nifti1Image(large_mask, affine)
+    small_mask = nibabel.Nifti1Image(small_mask, affine)
+
+    # Формируем пути сохранения новых масок
+    output_dir = mask_path.parent
+    large_output_path = output_dir / f'{patient_id}_large_mask.nii'
+    small_output_path = output_dir / f'{patient_id}_small_mask.nii'
+
+    # Сохраняем новые маски, рядом с исходной
+    nibabel.save(large_mask, large_output_path)
+    nibabel.save(small_mask, small_output_path)
