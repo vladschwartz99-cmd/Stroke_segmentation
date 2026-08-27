@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from nilearn import plotting
 from src.preprocessing import build_loader
-from src.evaluate_model import get_prediction
+from src.evaluate_model import get_prediction, get_ensemble_prediction
 
 
 
@@ -55,7 +55,7 @@ def visualize_one_slice(file_path, coordinate, slice_idx):
 
 
 
-def visualize_mri_with_two_mask(model, test_df, patient_id, protocols_list, threshold):
+def visualize_mri_with_two_mask(model, test_df, patient_id, protocols_list, threshold, small_model=None):
     """Функция визуализации МР-изображений с наложением исходной и предсказанной масок сегментации"""
 
     # Формируем датафрейм для одного пациента
@@ -74,7 +74,12 @@ def visualize_mri_with_two_mask(model, test_df, patient_id, protocols_list, thre
     affine = batch['image'].affine.cpu().numpy()
 
     # Получаем предсказание и переводим в бинарную маску
-    pred = get_prediction(full_image, model)
+    if small_model:
+        pred = get_ensemble_prediction(full_image, model, small_model)
+
+    else:
+        pred = get_prediction(full_image, model)
+
     pred_mask = (pred[0, 0] > threshold).cpu().numpy()
 
     # Получаем маску исходной сегментации
