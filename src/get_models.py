@@ -7,7 +7,7 @@ from monai.losses import DiceFocalLoss
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-def get_unet(in_channels, load_weights=False):
+def get_unet(in_channels, weights_dir=None):
     """Функция инициализации модели 3D U-Net, функции потерь и оптимизатора"""
 
     # Инициализации 3D U-Net
@@ -19,18 +19,11 @@ def get_unet(in_channels, load_weights=False):
         strides=(2, 2, 2, 2)
     ).to(device)
 
-    if load_weights:
+    # Загрузка весов в модель
+    if weights_dir:
 
-        # Загрузка весов в модель
-        if in_channels == 2:
-
-            unet.load_state_dict(torch.load('./weights/dwi_adc_models/best_UNet.pth'))
-            return unet
-
-        else:
-
-            unet.load_state_dict(torch.load('./weights/dwi_adc_flair_models/best_UNet.pth'))
-            return unet
+        unet.load_state_dict(torch.load(f'./weights/{weights_dir}/best_UNet.pth'))
+        return unet
 
     else:
 
@@ -43,7 +36,7 @@ def get_unet(in_channels, load_weights=False):
 
 
 
-def get_attention_unet(in_channels, load_weights=False):
+def get_attention_unet(in_channels, weights_dir=None):
     """Функция инициализации модели 3D Attention U-Net, функции потерь и оптимизатора"""
 
     # Инициализации 3D Attention U-Net
@@ -55,18 +48,11 @@ def get_attention_unet(in_channels, load_weights=False):
         strides=(2, 2, 2, 2)
     ).to(device)
 
-    if load_weights:
+    # Загрузка весов в модель
+    if weights_dir:
 
-        # Загрузка весов в модель
-        if in_channels == 2:
-
-            attention_unet.load_state_dict(torch.load('./weights/dwi_adc_models/best_AttentionUnet.pth'))
-            return attention_unet
-
-        else:
-
-            attention_unet.load_state_dict(torch.load('./weights/dwi_adc_flair_models/best_AttentionUnet.pth'))
-            return attention_unet
+        attention_unet.load_state_dict(torch.load(f'./weights/{weights_dir}/best_AttentionUnet.pth'))
+        return attention_unet
 
     else:
 
@@ -79,7 +65,7 @@ def get_attention_unet(in_channels, load_weights=False):
 
 
 
-def get_unet_plus_plus(in_channels, load_weights=False):
+def get_unet_plus_plus(in_channels, weights_dir=None):
     """Функция инициализации модели 3D U-Net ++, функции потерь и оптимизатора"""
 
     # Инициализации 3D U-Net ++
@@ -90,18 +76,11 @@ def get_unet_plus_plus(in_channels, load_weights=False):
         features=(16, 32, 64, 128, 256, 16)
     ).to(device)
 
-    if load_weights:
+    # Загрузка весов в модель
+    if weights_dir:
 
-        # Загрузка весов в модель
-        if in_channels == 2:
-
-            unet_plus_plus.load_state_dict(torch.load('./weights/dwi_adc_models/best_BasicUNetPlusPlus.pth'))
-            return unet_plus_plus
-
-        else:
-
-            unet_plus_plus.load_state_dict(torch.load('./weights/dwi_adc_flair_models/best_BasicUNetPlusPlus.pth'))
-            return unet_plus_plus
+        unet_plus_plus.load_state_dict(torch.load(f'./weights/{weights_dir}/best_BasicUNetPlusPlus.pth'))
+        return unet_plus_plus
 
     else:
 
@@ -114,7 +93,7 @@ def get_unet_plus_plus(in_channels, load_weights=False):
 
 
 
-def get_swin_unetr(in_channels, pretrained=True, load_weights=False):
+def get_swin_unetr(in_channels, weights_dir=None, pretrained=True):
     """Функция инициализации модели Swin UNETR, функции потерь и оптимизатора"""
 
     # Инициализация Swin UNETR
@@ -152,18 +131,11 @@ def get_swin_unetr(in_channels, pretrained=True, load_weights=False):
             strict=False
         )
 
-    if load_weights:
+    # Загрузка весов в модель
+    if weights_dir:
 
-        # Загрузка весов в модель
-        if in_channels == 2:
-
-            swin_unetr.load_state_dict(torch.load('./weights/dwi_adc_models/best_SwinUNETR.pth'))
-            return swin_unetr
-
-        else:
-
-            swin_unetr.load_state_dict(torch.load('./weights/dwi_adc_flair_models/best_SwinUNETR.pth'))
-            return swin_unetr
+        swin_unetr.load_state_dict(torch.load(f'./weights/{weights_dir}/best_SwinUNETR.pth'))
+        return swin_unetr
 
     else:
 
@@ -176,7 +148,7 @@ def get_swin_unetr(in_channels, pretrained=True, load_weights=False):
 
 
 
-def get_unet_plus_plus_for_refinement(load_weights=False):
+def get_unet_plus_plus_for_refinement(weights_dir=None):
     """Функция инициализации модели 3D U-Net ++, для подбора гиперпараметров"""
 
     # Инициализации 3D U-Net ++
@@ -188,9 +160,9 @@ def get_unet_plus_plus_for_refinement(load_weights=False):
     ).to(device)
 
     # Загрузка весов в модель
-    if load_weights:
+    if weights_dir:
 
-        unet_plus_plus.load_state_dict(torch.load('./weights/final_model/best_BasicUNetPlusPlus.pth'))
+        unet_plus_plus.load_state_dict(torch.load(f'./weights/{weights_dir}/best_BasicUNetPlusPlus.pth'))
         return unet_plus_plus
 
     # Возвращение модели без весов
